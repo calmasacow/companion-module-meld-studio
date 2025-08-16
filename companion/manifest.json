@@ -8,7 +8,7 @@
   "repository": "https://github.com/yourname/companion-module-meld-studio",
   "bugs": "https://github.com/yourname/companion-module-meld-studio/issues",
   "maintainers": [
-    { "name": "Your Name", "email": "you@example.com" }
+    { "name": "James Barnette", "email": "calmasacow@gmail.com" }
   ],
   "runtime": {
     "type": "node22",

@@ -1,465 +1,303 @@
-import { InstanceBase, InstanceStatus, runEntrypoint } from '@companion-module/base'
+import { InstanceBase, runEntrypoint } from '@companion-module/base'
 import WebSocket from 'ws'
 import fs from 'fs'
 import path from 'path'
-import { fileURLToPath } from 'url'
 import vm from 'vm'
 
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
+function getModuleDir() {
+  try {
+    const p = process.argv?.[1]
+    if (p) return path.dirname(p)
+  } catch {}
+  return process.cwd()
+}
+
+/** Load qwebchannel from packaged paths and execute in a sandbox */
+function loadQWebChannelOrThrow(baseDir) {
+  const candidates = [
+    // 1) Preferred: packaged inside the module bundle under companion/
+    path.join(baseDir, 'companion', 'vendor', 'qwebchannel.cjs'),
+    path.join(baseDir, 'companion', 'vendor', 'qwebchannel.js'),
+    // 2) Dev installs: vendor/ at root
+    path.join(baseDir, 'vendor', 'qwebchannel.cjs'),
+    path.join(baseDir, 'vendor', 'qwebchannel.js'),
+    // 3) Last resort: next to main.js
+    path.join(baseDir, 'qwebchannel.cjs'),
+    path.join(baseDir, 'qwebchannel.js'),
+  ]
+
+  let picked = null
+  for (const p of candidates) {
+    if (fs.existsSync(p)) {
+      picked = p
+      break
+    }
+  }
+  if (!picked) {
+    throw new Error(`qwebchannel not found (looked for: ${candidates.join(' , ')})`)
+  }
+
+  const code = fs.readFileSync(picked, 'utf8')
+  const sandbox = { module: { exports: {} }, exports: {}, console, setTimeout, clearTimeout }
+  vm.createContext(sandbox)
+  new vm.Script(code, { filename: picked }).runInContext(sandbox)
+
+  const exported = sandbox.module?.exports || sandbox.exports
+  const QWebChannel = exported?.QWebChannel || exported?.default
+  if (typeof QWebChannel !== 'function') throw new Error('QWebChannel export not found')
+  return QWebChannel
+}
 
 class MeldStudioInstance extends InstanceBase {
   constructor(internal) {
     super(internal)
     this.ws = null
-    this.transport = null
-    this.meld = null
-    this.sessionItems = {}
+    this.QWebChannel = null
+    this.qweb = null
 
-    this._isStreaming = false
-    this._isRecording = false
+    this.scenes = {}
+    this.currentSceneId = null
+    this.config = { host: '127.0.0.1', port: 13376 }
+    this.baseDir = getModuleDir()
   }
 
+  // Required in Companion v4
   getConfigFields() {
     return [
-      { type: 'textinput', id: 'host', label: 'Meld Host', width: 6, default: '127.0.0.1' },
-      { type: 'number', id: 'port', label: 'WebChannel Port', width: 4, default: 13376, min: 1, max: 65535 },
+      { type: 'textinput', id: 'host', label: 'Host/IP', width: 6, default: '127.0.0.1' },
+      { type: 'number', id: 'port', label: 'Port', width: 6, min: 1, max: 65535, default: 13376 },
     ]
   }
 
   async init(config) {
-    this.config = config || {}
-    if (!this.config.host) this.config.host = '127.0.0.1'
-    if (!this.config.port) this.config.port = 13376
+    this.config = { host: config?.host || '127.0.0.1', port: Number(config?.port) || 13376 }
+    this.updateStatus('connecting')
 
-    // Load vendor/qwebchannel.js via VM and expose constructor globally
-    try {
-      const qwcPath = path.join(__dirname, 'vendor', 'qwebchannel.js')
-      const code = fs.readFileSync(qwcPath, 'utf8')
-      const sandbox = { module: { exports: {} }, exports: {}, window: {}, self: {}, global: {}, console }
-      vm.createContext(sandbox)
-      new vm.Script(code, { filename: 'qwebchannel.js' }).runInContext(sandbox)
-      const QWC =
-        sandbox.module?.exports?.QWebChannel ||
-        sandbox.exports?.QWebChannel ||
-        sandbox.window?.QWebChannel ||
-        sandbox.self?.QWebChannel ||
-        sandbox.global?.QWebChannel ||
-        sandbox.QWebChannel
-      if (typeof QWC !== 'function') throw new Error('QWebChannel export not found or not a function')
-      globalThis.QWebChannel = QWC
-    } catch (e) {
-      this.updateStatus(InstanceStatus.Error, 'Failed to load vendor/qwebchannel.js')
-      this.log('error', `Load qwebchannel.js failed: ${e.message}`)
-      return
-    }
+    this._defineFeedbacks()
+    this._defineActions()
+    this._definePresets() // initially empty; filled once scenes load
 
-    this._initVariables()
-    this._initFeedbacks()
-    this._initActions()
     this._connect()
   }
 
   async configUpdated(config) {
-    this.config = config || this.config
-    this._disconnect()
+    this.config = { host: config?.host || '127.0.0.1', port: Number(config?.port) || 13376 }
+    this.log('debug', `Config updated: ${this.config.host}:${this.config.port}`)
     this._connect()
   }
 
   async destroy() {
-    this._disconnect()
+    if (this.ws) {
+      try { this.ws.close() } catch {}
+      this.ws = null
+    }
   }
 
-  // ---------- helpers ----------
-  _getSceneChoices() {
-    const items = this.sessionItems || {}
-    const out = []
-    for (const [id, obj] of Object.entries(items)) {
-      if (obj && obj.type === 'scene') {
-        const label = obj.name ? `${obj.name} (${id.slice(0, 8)})` : id
-        out.push({ id, label, index: obj.index ?? 9999 })
+  _connect() {
+    if (this.ws) {
+      try { this.ws.close() } catch {}
+      this.ws = null
+    }
+
+    try {
+      const url = `ws://${this.config.host}:${this.config.port}`
+      this.log('info', `Connecting to Meld Studio: ${url}`)
+      this.ws = new WebSocket(url)
+
+      this.ws.on('open', () => {
+        try {
+          this.QWebChannel = loadQWebChannelOrThrow(this.baseDir)
+        } catch (err) {
+          this.updateStatus('connection_failure', 'Failed to load qwebchannel.js')
+          this.log('error', `Load qwebchannel.js failed: ${err.message}`)
+          return
+        }
+
+        new this.QWebChannel(this.ws, (channel) => {
+          this.qweb = channel.objects.meld
+          this.updateStatus('ok')
+
+          if (this.qweb?.sceneChanged?.connect) {
+            this.qweb.sceneChanged.connect((id) => {
+              this.currentSceneId = id
+              this.checkFeedbacks('scene_active')
+            })
+          }
+
+          this._refreshScenes()
+        })
+      })
+
+      this.ws.on('close', () => {
+        this.updateStatus('disconnected')
+        setTimeout(() => this._connect(), 3000)
+      })
+
+      this.ws.on('error', (err) => {
+        this.updateStatus('connection_failure', err?.message || 'WebSocket error')
+      })
+    } catch (e) {
+      this.updateStatus('connection_failure', e?.message || 'Connect failed')
+    }
+  }
+
+  _refreshScenes() {
+    if (!this.qweb) return
+
+    if (typeof this.qweb.getScenes === 'function') {
+      this.qweb.getScenes((scenes) => this._ingestScenes(scenes))
+    } else if (this.qweb.session && this.qweb.session.items) {
+      const items = this.qweb.session.items
+      const scenes = Object.keys(items)
+        .filter((id) => items[id]?.type === 'scene')
+        .map((id) => ({ id, name: items[id]?.name || id }))
+      this._ingestScenes(scenes)
+    } else {
+      this.log('warn', 'Unable to discover scenes (no getScenes() or session.items).')
+    }
+  }
+
+  _ingestScenes(scenesArray) {
+    this.scenes = {}
+    for (const scene of scenesArray || []) {
+      const cleanName = String(scene.name || scene.id).replace(/\s*\(.*?\)\s*$/, '')
+      this.scenes[scene.id] = { id: scene.id, name: cleanName }
+    }
+
+    this._defineActions()
+    this._refreshFeedbackChoices()
+    this._definePresets() // regenerate presets now that we know scenes
+  }
+
+  _defineActions() {
+    const actions = {}
+
+    // One action per scene
+    for (const id in this.scenes) {
+      const scene = this.scenes[id]
+      actions[`show_scene_${id}`] = {
+        name: `Show Scene: ${scene.name}`,
+        options: [],
+        callback: async () => {
+          if (!this.qweb) return
+          if (typeof this.qweb.showScene === 'function') this.qweb.showScene(id)
+          else if (typeof this.qweb.switchScene === 'function') this.qweb.switchScene(id)
+        },
       }
     }
-    out.sort((a, b) => (a.index === b.index ? a.label.localeCompare(b.label) : a.index - b.index))
-    return out.map(({ id, label }) => ({ id, label }))
-  }
 
-  _getCurrentSceneId() {
-    for (const [id, obj] of Object.entries(this.sessionItems || {})) {
-      if (obj?.type === 'scene' && obj.current) return id
+    // Streaming toggle
+    actions['toggle_stream'] = {
+      name: 'Toggle Streaming',
+      options: [],
+      callback: async () => {
+        if (!this.qweb) return
+        if (typeof this.qweb.toggleStream === 'function') this.qweb.toggleStream()
+        else if (typeof this.qweb.toggleStreaming === 'function') this.qweb.toggleStreaming()
+      },
     }
-    return ''
+
+    // Recording toggle
+    actions['toggle_record'] = {
+      name: 'Toggle Recording',
+      options: [],
+      callback: async () => {
+        if (!this.qweb) return
+        if (typeof this.qweb.toggleRecord === 'function') this.qweb.toggleRecord()
+        else if (typeof this.qweb.toggleRecording === 'function') this.qweb.toggleRecording()
+      },
+    }
+
+    this.setActionDefinitions(actions)
   }
 
-  _getSceneNameById(id) {
-    const obj = (this.sessionItems || {})[id]
-    return obj?.type === 'scene' ? (obj.name || id) : id
-  }
-
-  _getCurrentSceneName() {
-    const id = this._getCurrentSceneId()
-    return this._getSceneNameById(id)
-  }
-
-  _refreshActionChoices() {
-    this._initActions()
-    // refresh feedback dropdowns & presets too
-    this._initFeedbacks()
-    this._refreshPresets()
-    this.checkFeedbacks('labelSceneName', 'sceneIsLive')
-  }
-
-  _initVariables() {
-    this.setVariableDefinitions([
-      { variableId: 'current_scene_name', name: 'Current Scene Name' },
-      { variableId: 'is_streaming', name: 'Streaming status (ON/OFF)' },
-      { variableId: 'is_recording', name: 'Recording status (ON/OFF)' },
-    ])
-    this.setVariableValues({
-      current_scene_name: '',
-      is_streaming: 'OFF',
-      is_recording: 'OFF',
-    })
-  }
-
-  _updateVariables() {
-    this.setVariableValues({
-      current_scene_name: this._getCurrentSceneName() || '',
-      is_streaming: this._isStreaming ? 'ON' : 'OFF',
-      is_recording: this._isRecording ? 'ON' : 'OFF',
-    })
-  }
-
-  _initFeedbacks() {
-    const sceneChoices = this._getSceneChoices()
-
+  _defineFeedbacks() {
     this.setFeedbackDefinitions({
-      // Advanced feedback that writes button text to chosen scene name
-      // and returns a full style every time (no Companion fallback blue).
-      labelSceneName: {
-        name: 'Label: Scene Name (from dropdown)',
-        type: 'advanced',
-        description: 'Sets button text to the selected scene name. Optionally highlight if that scene is live.',
+      scene_active: {
+        type: 'boolean',
+        name: 'Scene Active',
+        description: 'Change button style if the selected scene is currently live.',
         options: [
-          { type: 'dropdown', id: 'sceneId', label: 'Scene', choices: sceneChoices, default: sceneChoices[0]?.id ?? '', allowCustom: true },
-          { type: 'checkbox', id: 'highlightLive', label: 'Highlight when scene is live', default: true },
-          { type: 'colorpicker', id: 'idleBg', label: 'Background when NOT live', default: 0x000000 },
-          { type: 'colorpicker', id: 'idleFg', label: 'Text color when NOT live', default: 0xffffff },
-          { type: 'colorpicker', id: 'liveBg', label: 'Background when LIVE', default: 0xcc0000 },
-          { type: 'colorpicker', id: 'liveFg', label: 'Text color when LIVE', default: 0xffffff },
+          { type: 'dropdown', id: 'scene', label: 'Scene', choices: [] },
         ],
-        callback: (fb) => {
-          const sceneId = fb.options?.sceneId || ''
-          if (!sceneId) return null
-          const name = this._getSceneNameById(sceneId) || sceneId
-          const isLive = this._getCurrentSceneId() === sceneId
-          if (fb.options?.highlightLive && isLive) {
-            return { text: name, bgcolor: fb.options.liveBg ?? 0xcc0000, color: fb.options.liveFg ?? 0xffffff }
-          } else {
-            return { text: name, bgcolor: fb.options.idleBg ?? 0x000000, color: fb.options.idleFg ?? 0xffffff }
-          }
-        },
-      },
-
-      recordingOn: {
-        name: 'Recording is ON',
-        type: 'boolean',
-        description: 'True when Meld is recording',
-        defaultStyle: { bgcolor: 0xff0000, color: 0xffffff },
-        options: [],
-        callback: () => this._isRecording === true,
-      },
-
-      streamingOn: {
-        name: 'Streaming is ON',
-        type: 'boolean',
-        description: 'True when Meld is streaming',
-        defaultStyle: { bgcolor: 0x00aa00, color: 0xffffff },
-        options: [],
-        callback: () => this._isStreaming === true,
-      },
-
-      // Boolean feedback that turns red when selected scene is live
-      sceneIsLive: {
-        name: 'Scene is Live',
-        type: 'boolean',
-        description: 'True when the selected scene is currently live',
-        defaultStyle: { bgcolor: 0xcc0000, color: 0xffffff },
-        options: [
-          { type: 'dropdown', id: 'sceneId', label: 'Scene', choices: sceneChoices, default: sceneChoices[0]?.id ?? '', allowCustom: true },
-        ],
-        callback: (fb) => {
-          const targetId = fb.options?.sceneId || ''
-          const currentId = this._getCurrentSceneId()
-          return targetId && currentId && targetId === currentId
-        },
+        defaultStyle: { bgcolor: 0xcc0000, color: 0xffffff }, // red when active
+        callback: (fb) => this.currentSceneId && fb.options?.scene === this.currentSceneId,
       },
     })
   }
 
-  // ---------- PRESETS ----------
-  _initPresets() {
-    const presets = []
-    const scenes = []
+  _refreshFeedbackChoices() {
+    const sceneChoices = Object.values(this.scenes).map((s) => ({ id: s.id, label: s.name }))
+    this.setFeedbackDefinitions({
+      scene_active: {
+        type: 'boolean',
+        name: 'Scene Active',
+        description: 'Change button style if the selected scene is currently live.',
+        options: [
+          { type: 'dropdown', id: 'scene', label: 'Scene', choices: sceneChoices },
+        ],
+        defaultStyle: { bgcolor: 0xcc0000, color: 0xffffff },
+        callback: (fb) => this.currentSceneId && fb.options?.scene === this.currentSceneId,
+      },
+    })
+  }
 
-    for (const [id, obj] of Object.entries(this.sessionItems || {})) {
-      if (obj?.type === 'scene') scenes.push({ id, name: obj.name || id, index: obj.index ?? 9999 })
-    }
-    scenes.sort((a, b) => (a.index === b.index ? a.name.localeCompare(b.name) : a.index - b.index))
+  /** Build drag-and-drop presets for the Presets tab */
+  _definePresets() {
+    const presets = []
+
+    // Category buckets (helps users find things)
+    const catScenes = 'Scenes'
+    const catControl = 'Control'
 
     // One preset per scene
-    for (const sc of scenes) {
+    for (const id in this.scenes) {
+      const scene = this.scenes[id]
       presets.push({
         type: 'button',
-        category: 'Meld Studio / Scenes',
-        name: `Scene: ${sc.name}`,
-        style: { text: sc.name, size: 'auto', color: 0xffffff, bgcolor: 0x000000 },
+        category: catScenes,
+        name: `Scene: ${scene.name}`,
+        style: {
+          text: scene.name,
+          size: 'auto',
+          color: 0xffffff,
+          bgcolor: 0x000000,
+        },
         steps: [
           {
-            down: [{ actionId: 'showScene', options: { sceneId: sc.id } }],
+            down: [
+              { actionId: `show_scene_${id}`, options: {} },
+            ],
             up: [],
           },
         ],
         feedbacks: [
-          // Red when that scene is live
-          { feedbackId: 'sceneIsLive', options: { sceneId: sc.id }, style: { bgcolor: 0xcc0000, color: 0xffffff } },
-          // Label with consistent colors, highlight when live
-          {
-            feedbackId: 'labelSceneName',
-            options: {
-              sceneId: sc.id,
-              highlightLive: true,
-              idleBg: 0x000000,
-              idleFg: 0xffffff,
-              liveBg: 0xcc0000,
-              liveFg: 0xffffff,
-            },
-          },
+          { feedbackId: 'scene_active', options: { scene: id } },
         ],
       })
     }
 
-    // Utility presets
-    presets.push(
-      {
-        type: 'button',
-        category: 'Meld Studio / Utility',
-        name: 'Toggle Recording',
-        style: { text: 'REC', size: 'auto', color: 0xffffff, bgcolor: 0x000000 },
-        steps: [{ down: [{ actionId: 'toggleRecord', options: {} }], up: [] }],
-        feedbacks: [{ feedbackId: 'recordingOn', style: { bgcolor: 0xff0000, color: 0xffffff } }],
-      },
-      {
-        type: 'button',
-        category: 'Meld Studio / Utility',
-        name: 'Toggle Streaming',
-        style: { text: 'STREAM', size: 'auto', color: 0xffffff, bgcolor: 0x000000 },
-        steps: [{ down: [{ actionId: 'toggleStream', options: {} }], up: [] }],
-        feedbacks: [{ feedbackId: 'streamingOn', style: { bgcolor: 0x00aa00, color: 0xffffff } }],
-      }
-    )
+    // Streaming/Recording toggle presets (handy defaults)
+    presets.push({
+      type: 'button',
+      category: catControl,
+      name: 'Toggle Streaming',
+      style: { text: 'Stream', size: 'auto', color: 0xffffff, bgcolor: 0x000000 },
+      steps: [{ down: [{ actionId: 'toggle_stream', options: {} }], up: [] }],
+      feedbacks: [],
+    })
+
+    presets.push({
+      type: 'button',
+      category: catControl,
+      name: 'Toggle Recording',
+      style: { text: 'Record', size: 'auto', color: 0xffffff, bgcolor: 0x000000 },
+      steps: [{ down: [{ actionId: 'toggle_record', options: {} }], up: [] }],
+      feedbacks: [],
+    })
 
     this.setPresetDefinitions(presets)
   }
-
-  _refreshPresets() {
-    this._initPresets()
-  }
-  // -------------------------------------------
-
-  _connect() {
-    const url = `ws://${this.config.host}:${this.config.port}`
-    this.updateStatus(InstanceStatus.Connecting)
-    this.log('info', `Connecting to Meld: ${url}`)
-
-    this.ws = new WebSocket(url)
-
-    // Qt-style transport wrapper for QWebChannel
-    this.transport = {
-      onmessage: null,
-      send: (data) => {
-        try {
-          if (typeof data !== 'string') data = JSON.stringify(data)
-          this.ws.send(data)
-        } catch (e) {
-          this.log('error', `Transport send failed: ${e.message}`)
-        }
-      },
-    }
-
-    this.ws.on('open', () => {
-      this.ws.on('message', (frame) => {
-        const data = typeof frame === 'string' ? frame : frame.toString('utf8')
-        if (typeof this.transport.onmessage === 'function') this.transport.onmessage({ data })
-      })
-
-      // eslint-disable-next-line no-undef
-      const QWC = globalThis.QWebChannel
-      // eslint-disable-next-line no-new
-      new QWC(this.transport, (channel) => {
-        this.meld = channel.objects.meld
-        this.log('info', 'Meld WebChannel ready')
-
-        // Seed state
-        try {
-          this.sessionItems = this.meld.session?.items || {}
-        } catch {
-          this.sessionItems = {}
-        }
-        try {
-          this._isStreaming = !!this.meld.isStreaming
-          this._isRecording = !!this.meld.isRecording
-        } catch {}
-
-        // Update UI bits
-        this._updateVariables()
-        this._refreshActionChoices()
-        this._initPresets()
-        this.checkFeedbacks('labelSceneName', 'sceneIsLive', 'recordingOn', 'streamingOn')
-
-        // Signals
-        this.meld.sessionChanged.connect(() => {
-          try {
-            this.sessionItems = this.meld.session.items || {}
-          } catch {
-            this.sessionItems = {}
-          }
-          this._updateVariables()
-          this._refreshActionChoices()
-          this._refreshPresets()
-          this.checkFeedbacks('labelSceneName', 'sceneIsLive')
-        })
-
-        this.meld.isStreamingChanged.connect(() => {
-          this._isStreaming = !!this.meld.isStreaming
-          this._updateVariables()
-          this.checkFeedbacks('streamingOn')
-        })
-
-        this.meld.isRecordingChanged.connect(() => {
-          this._isRecording = !!this.meld.isRecording
-          this._updateVariables()
-          this.checkFeedbacks('recordingOn')
-        })
-
-        this.meld.gainUpdated.connect((trackId, gain, muted) => {
-          this.log('debug', `gainUpdated track=${trackId} gain=${gain} muted=${muted}`)
-        })
-
-        this.updateStatus(InstanceStatus.Ok)
-      })
-    })
-
-    this.ws.on('close', () => {
-      this.updateStatus(InstanceStatus.Disconnected)
-      this.meld = null
-      this.transport = null
-      this.log('warn', 'WebSocket closed')
-    })
-
-    this.ws.on('error', (err) => {
-      this.updateStatus(InstanceStatus.Error, err.message)
-      this.log('error', `WebSocket error: ${err.message}`)
-    })
-  }
-
-  _disconnect() {
-    if (this.ws) {
-      try { this.ws.close() } catch {}
-    }
-    this.ws = null
-    this.transport = null
-    this.meld = null
-  }
-
-  _initActions() {
-    const sceneChoices = this._getSceneChoices()
-
-    this.setActionDefinitions({
-      toggleRecord: { name: 'Toggle Record', options: [], callback: () => this._mCall('toggleRecord') },
-      toggleStream: { name: 'Toggle Stream', options: [], callback: () => this._mCall('toggleStream') },
-
-      showScene: {
-        name: 'Show Scene',
-        options: [
-          { type: 'dropdown', id: 'sceneId', label: 'Scene', choices: sceneChoices, default: sceneChoices[0]?.id ?? '', allowCustom: true },
-        ],
-        callback: (evt) => this._mCall('showScene', evt.options.sceneId),
-      },
-
-      setStagedScene: {
-        name: 'Set Staged Scene',
-        options: [
-          { type: 'dropdown', id: 'sceneId', label: 'Scene', choices: sceneChoices, default: sceneChoices[0]?.id ?? '', allowCustom: true },
-        ],
-        callback: (evt) => this._mCall('setStagedScene', evt.options.sceneId),
-      },
-
-      showStagedScene: { name: 'Show Staged Scene', options: [], callback: () => this._mCall('showStagedScene') },
-
-      toggleMute: {
-        name: 'Toggle Mute (Track ID)',
-        options: [{ type: 'textinput', id: 'trackId', label: 'Track ID', default: '' }],
-        callback: (evt) => this._mCall('toggleMute', evt.options.trackId),
-      },
-      toggleMonitor: {
-        name: 'Toggle Monitor (Track ID)',
-        options: [{ type: 'textinput', id: 'trackId', label: 'Track ID', default: '' }],
-        callback: (evt) => this._mCall('toggleMonitor', evt.options.trackId),
-      },
-
-      toggleLayer: {
-        name: 'Toggle Layer (Scene ID + Layer ID)',
-        options: [
-          { type: 'dropdown', id: 'sceneId', label: 'Scene', choices: sceneChoices, default: sceneChoices[0]?.id ?? '', allowCustom: true },
-          { type: 'textinput', id: 'layerId', label: 'Layer ID', default: '' },
-        ],
-        callback: (evt) => this._mCall('toggleLayer', evt.options.sceneId, evt.options.layerId),
-      },
-
-      toggleEffect: {
-        name: 'Toggle Effect (Scene + Layer + Effect ID)',
-        options: [
-          { type: 'dropdown', id: 'sceneId', label: 'Scene', choices: sceneChoices, default: sceneChoices[0]?.id ?? '', allowCustom: true },
-          { type: 'textinput', id: 'layerId', label: 'Layer ID', default: '' },
-          { type: 'textinput', id: 'effectId', label: 'Effect ID', default: '' },
-        ],
-        callback: (evt) => this._mCall('toggleEffect', evt.options.sceneId, evt.options.layerId, evt.options.effectId),
-      },
-
-      setGain: {
-        name: 'Set Gain (Track ID, 0.0–1.0)',
-        options: [
-          { type: 'textinput', id: 'trackId', label: 'Track ID', default: '' },
-          { type: 'number', id: 'gain', label: 'Gain (0–1)', default: 0.5, min: 0, max: 1, step: 0.01 },
-        ],
-        callback: (evt) => this._mCall('setGain', evt.options.trackId, Number(evt.options.gain)),
-      },
-
-      sendCommand: {
-        name: 'Send Command (string)',
-        options: [{ type: 'textinput', id: 'command', label: 'Command', default: 'meld.screenshot' }],
-        callback: (evt) => this._mCall('sendCommand', evt.options.command),
-      },
-    })
-  }
-
-  _mCall(name, ...args) {
-    if (!this.meld) {
-      this.log('warn', 'Meld not ready')
-      return
-    }
-    try {
-      const fn = this.meld[name]
-      if (typeof fn === 'function') {
-        fn(...args)
-      } else {
-        this.log('error', `Unknown Meld function: ${name}`)
-      }
-    } catch (e) {
-      this.log('error', `Call failed: ${name}(${args.join(', ')}): ${e.message}`)
-    }
-  }
 }
 
-runEntrypoint(MeldStudioInstance)
+runEntrypoint(MeldStudioInstance, [])
