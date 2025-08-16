@@ -1,9 +1,12 @@
-﻿name: Release
+name: Release
 
 on:
   push:
     tags:
       - 'v*'
+
+permissions:
+  contents: write   # <-- allow creating/updating Releases
 
 jobs:
   release:
@@ -27,8 +30,8 @@ jobs:
         run: echo "PKG=$(ls dist/*.tgz)" >> $GITHUB_ENV
 
       - name: Upload Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.PKG }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: false
