@@ -14,8 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Feedback**: active scene button highlights with a red background (`#CC0000`) when the scene is live.
 - **Presets**: automatic generation of drag-and-drop buttons for all scenes discovered in Meld Studio.
 - Configurable connection settings (host, port).
-- Trigger-Toggle recording and streaming
+- **Recording control**: start, stop, and toggle recording from Companion.
+- **Streaming control**: start, stop, and toggle streaming from Companion.
 
 ### Notes
-- This release focuses on **scene control and feedback**.  
+- This release focuses on **scene control, streaming, and recording**.  
 - Future updates may include parameter control, timeline triggers, or multi-scene state awareness.
