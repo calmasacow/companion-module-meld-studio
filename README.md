@@ -4,14 +4,14 @@ This is a [Bitfocus Companion](https://bitfocus.io/companion) module to control 
 
 ## Features
 
-- Connects directly to Meld Studio via WebSocket / WebChannel.
-- Actions:
-  - Change scenes.
-  - Trigger/toggle both recording and streaming.
-- Feedback:
-  - Button background color updates when a scene is active (default red `#CC0000`).
-- Presets:
-  - Drag-and-drop prebuilt buttons for each available scene.
+- Connects to **Meld Studio** over WebSocket (Qt WebChannel).
+- **Scene switching**: assign any scene to a button for instant switching.
+- **Scene feedback**: button background changes to red when the scene is active.
+- **Presets**: auto-generates drag-and-drop buttons for each discovered scene.
+- **Recording control**: start, stop, and toggle recording directly from Companion.
+- **Streaming control**: start, stop, and toggle streaming directly from Companion.
+- Simple configuration (host/port).
+
 
 ## Requirements
 
