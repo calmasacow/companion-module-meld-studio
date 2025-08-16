@@ -3,35 +3,72 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*'          # runs on any vX.Y.Z tag
 
 permissions:
-  contents: write   # <-- allow creating/updating Releases
+  contents: write     # needed to create/edit releases
 
 jobs:
   release:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: 'yarn'
 
       - name: Install dependencies
-        run: yarn install --frozen-lockfile
+        run: yarn install
 
-      - name: Build module
+      - name: Build module (companion tools)
         run: yarn package
 
-      - name: Find build artifact
-        id: find_pkg
-        run: echo "PKG=$(ls dist/*.tgz)" >> $GITHUB_ENV
+      - name: Ensure package .tgz exists (or create one)
+        id: pkg
+        shell: bash
+        run: |
+          set -e
 
-      - name: Upload Release
+          TAG="${GITHUB_REF_NAME}"                       # e.g. v1.0.1
+          NAME="$(node -p "require('./package.json').name || 'module'")"
+          CLEAN_TAG="${TAG#v}"                           # 1.0.1
+          OUTDIR="dist"
+          mkdir -p "$OUTDIR"
+
+          # Try to find an existing .tgz from the builder
+          TGZ=""
+          if compgen -G "*.tgz" >/dev/null; then
+            TGZ="$(ls -1 *.tgz | head -n1)"
+          elif compgen -G "dist/*.tgz" >/dev/null; then
+            TGZ="$(ls -1 dist/*.tgz | head -n1)"
+          fi
+
+          if [ -z "$TGZ" ]; then
+            echo "No .tgz produced by builder, creating one…"
+
+            # Build the file list Companion expects
+            FILES="companion main.js package.json"
+            [ -d vendor ] && FILES="$FILES vendor"
+            [ -f README.md ] && FILES="$FILES README.md"
+            [ -f LICENSE ] && FILES="$FILES LICENSE"
+
+            # Name the archive consistently
+            TGZ="$OUTDIR/${NAME}-${CLEAN_TAG}.tgz"
+
+            # Create the tarball
+            tar -czf "$TGZ" $FILES
+          fi
+
+          echo "TGZ=$TGZ" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release & upload package
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.PKG }}
+          files: ${{ steps.pkg.outputs.TGZ }}
           tag_name: ${{ github.ref_name }}
           generate_release_notes: false
